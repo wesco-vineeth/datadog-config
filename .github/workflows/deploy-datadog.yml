@@ -137,6 +137,8 @@ jobs:
                  -i inventory/hosts.ini \
                  playbooks/deploy-changed-file.yml \
                  --extra-vars \
-                 'source_file=$remote_source destination_file=$remote_destination'"
+                 --extra-vars \
+                   'desired_state=present source_file=$remote_source destination_file=$remote_destination'
+
 
           done < changed-files.txt
