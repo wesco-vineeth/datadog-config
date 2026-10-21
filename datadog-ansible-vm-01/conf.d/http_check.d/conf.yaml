@@ -1,0 +1,6 @@
+init_config:
+
+instances:
+  - name: GitHub Actions HTTP test
+    url: https://example.com
+    timeout: 10
