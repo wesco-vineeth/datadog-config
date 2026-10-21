@@ -1,4 +1,4 @@
-name: Deploy Datadog Config
+name: Deploy Changed Datadog Config
 
 on:
   push:
@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - name: Configure SSH
         run: |
@@ -24,32 +26,75 @@ jobs:
           printf '%s\n' "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
 
-      - name: Copy files to VM staging
+      - name: Detect changed configuration files
+        id: changed
+        shell: bash
+        run: |
+          git diff --name-only --diff-filter=AM HEAD^ HEAD \
+            -- "datadog-ansible-vm-01/**" \
+            | grep -E '\.ya?ml$' > changed-files.txt || true
+
+          echo "Changed configuration files:"
+          cat changed-files.txt
+
+          if [ -s changed-files.txt ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Copy playbook and inventory to VM
+        if: steps.changed.outputs.has_changes == 'true'
         run: |
           ssh -o StrictHostKeyChecking=no \
             -i ~/.ssh/id_rsa \
             "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
-            "mkdir -p /home/azureuser/datadog-staging/conf.d/http_check.d"
+            "mkdir -p ~/datadog-deployment/playbooks \
+                      ~/datadog-deployment/inventory \
+                      ~/datadog-staging"
 
           scp -o StrictHostKeyChecking=no \
             -i ~/.ssh/id_rsa \
-            datadog-ansible-vm-01/conf.d/http_check.d/conf.yaml \
-            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/home/azureuser/datadog-staging/conf.d/http_check.d/conf.yaml"
+            playbooks/deploy-changed-file.yml \
+            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:~/datadog-deployment/playbooks/"
 
-      - name: Run Ansible Playbook
-        run: |
-          ssh -o StrictHostKeyChecking=no \
+          scp -o StrictHostKeyChecking=no \
             -i ~/.ssh/id_rsa \
-            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
-            "cd ~/datadog-deployment && \
-             ansible-playbook \
-             -i inventory/hosts.ini \
-             playbooks/deploy-changed-file.yml \
-             --extra-vars 'source_file=/home/azureuser/datadog-staging/conf.d/http_check.d/conf.yaml destination_file=/etc/datadog-agent/conf.d/http_check.d/conf.yaml'"
+            inventory/hosts.ini \
+            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:~/datadog-deployment/inventory/"
 
-      - name: Verify Deployment
+      - name: Deploy only changed files
+        if: steps.changed.outputs.has_changes == 'true'
+        shell: bash
         run: |
-          ssh -o StrictHostKeyChecking=no \
-            -i ~/.ssh/id_rsa \
-            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
-            "sudo cat /etc/datadog-agent/conf.d/http_check.d/conf.yaml"
+          set -e
+
+          while IFS= read -r changed_file; do
+            relative_path="${changed_file#datadog-ansible-vm-01/}"
+            staged_file="$HOME/datadog-staging/$relative_path"
+            destination_file="/etc/datadog-agent/$relative_path"
+
+            echo "Changed file: $changed_file"
+            echo "VM destination: $destination_file"
+
+            ssh -o StrictHostKeyChecking=no \
+              -i ~/.ssh/id_rsa \
+              "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
+              "mkdir -p \"\$(dirname \"$staged_file\")\""
+
+            scp -o StrictHostKeyChecking=no \
+              -i ~/.ssh/id_rsa \
+              "$changed_file" \
+              "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:$staged_file"
+
+            ssh -o StrictHostKeyChecking=no \
+              -i ~/.ssh/id_rsa \
+              "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
+              "cd ~/datadog-deployment && \
+               ansible-playbook \
+                 -i inventory/hosts.ini \
+                 playbooks/deploy-changed-file.yml \
+                 --extra-vars \
+                 'source_file=$staged_file destination_file=$destination_file'"
+
+          done < changed-files.txt
