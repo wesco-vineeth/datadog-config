@@ -28,19 +28,15 @@ jobs:
 
       - name: Detect changed configuration files
         id: changed
-        shell: bash
         run: |
           git diff --name-only --diff-filter=AM HEAD^ HEAD \
             -- "datadog-ansible-vm-01/**" \
             | grep -E '\.ya?ml$' > changed-files.txt || true
 
-          echo "Changed configuration files:"
-          cat changed-files.txt
-
           if [ -s changed-files.txt ]; then
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "has_changes=true" >> $GITHUB_OUTPUT
           else
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Copy playbook and inventory to VM
@@ -51,7 +47,7 @@ jobs:
             "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
             "mkdir -p ~/datadog-deployment/playbooks \
                       ~/datadog-deployment/inventory \
-                      ~/datadog-staging"
+                      /home/azureuser/datadog-staging"
 
           scp -o StrictHostKeyChecking=no \
             -i ~/.ssh/id_rsa \
@@ -65,22 +61,19 @@ jobs:
 
       - name: Deploy only changed files
         if: steps.changed.outputs.has_changes == 'true'
-        shell: bash
         run: |
-          set -e
-
           while IFS= read -r changed_file; do
-            relative_path="${changed_file#datadog-ansible-vm-01/}"
-            staged_file="$HOME/datadog-staging/$relative_path"
-            destination_file="/etc/datadog-agent/$relative_path"
 
-            echo "Changed file: $changed_file"
-            echo "VM destination: $destination_file"
+            relative_path="${changed_file#datadog-ansible-vm-01/}"
+
+            staged_file="/home/azureuser/datadog-staging/$relative_path"
+
+            destination_file="/etc/datadog-agent/$relative_path"
 
             ssh -o StrictHostKeyChecking=no \
               -i ~/.ssh/id_rsa \
               "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
-              "mkdir -p \"\$(dirname \"$staged_file\")\""
+              "mkdir -p \$(dirname $staged_file)"
 
             scp -o StrictHostKeyChecking=no \
               -i ~/.ssh/id_rsa \
@@ -92,9 +85,9 @@ jobs:
               "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
               "cd ~/datadog-deployment && \
                ansible-playbook \
-                 -i inventory/hosts.ini \
-                 playbooks/deploy-changed-file.yml \
-                 --extra-vars \
-                 'source_file=$staged_file destination_file=$destination_file'"
+               -i inventory/hosts.ini \
+               playbooks/deploy-changed-file.yml \
+               --extra-vars \
+               'source_file=$staged_file destination_file=$destination_file'"
 
           done < changed-files.txt
