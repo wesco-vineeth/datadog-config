@@ -39,7 +39,7 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          git diff --name-only --diff-filter=AM \
+          git diff --name-only --diff-filter=AMD\
             "${{ github.event.before }}" \
             "${{ github.sha }}" \
             -- "datadog-ansible-vm-01/**" \
