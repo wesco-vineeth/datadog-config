@@ -1,14 +1,19 @@
-name: Deploy Datadog Config
+name: Deploy Changed Datadog Config
 
 on:
   push:
     branches:
       - main
     paths:
-      - "datadog-ansible-vm-01/**"
+      - "datadog-ansible-vm-01/**/*.yaml"
+      - "datadog-ansible-vm-01/**/*.yml"
 
 permissions:
   contents: read
+
+concurrency:
+  group: datadog-vm-01-deployment
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -17,35 +22,121 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - name: Configure SSH
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
         run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VM_SSH_KEY" > "$HOME/.ssh/id_rsa"
+          chmod 600 "$HOME/.ssh/id_rsa"
 
-      - name: Copy repository files to VM
+      - name: Detect changed configuration files
+        id: changed
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          git diff --name-only --diff-filter=AM \
+            "${{ github.event.before }}" \
+            "${{ github.sha }}" \
+            -- "datadog-ansible-vm-01/**" \
+            | grep -E '\.ya?ml$' > changed-files.txt || true
+
+          echo "Changed YAML files:"
+          cat changed-files.txt
+
+          if [ -s changed-files.txt ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare deployment files
+        if: steps.changed.outputs.has_changes == 'true'
+        env:
+          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p deployment-files
+
+          while IFS= read -r changed_file; do
+            relative_path="${changed_file#datadog-ansible-vm-01/}"
+            prepared_file="deployment-files/$relative_path"
+
+            mkdir -p "$(dirname "$prepared_file")"
+
+            if [ "$relative_path" = "datadog.yaml" ]; then
+              sed "s|__DATADOG_API_KEY__|${DATADOG_API_KEY}|g" \
+                "$changed_file" > "$prepared_file"
+            else
+              cp "$changed_file" "$prepared_file"
+            fi
+          done < changed-files.txt
+
+      - name: Copy Ansible playbook to VM
+        if: steps.changed.outputs.has_changes == 'true'
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
         run: |
           ssh -o StrictHostKeyChecking=no \
-            -i ~/.ssh/id_rsa \
-            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
-            "mkdir -p ~/datadog-deployment"
+            -i "$HOME/.ssh/id_rsa" \
+            "$VM_USER@$VM_HOST" \
+            "mkdir -p ~/datadog-deployment/playbooks \
+                       ~/datadog-deployment/inventory \
+                       ~/datadog-staging"
 
           scp -o StrictHostKeyChecking=no \
-            -i ~/.ssh/id_rsa \
-            -r datadog-ansible-vm-01 inventory playbooks \
-            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:~/datadog-deployment/"
+            -i "$HOME/.ssh/id_rsa" \
+            playbooks/deploy-changed-file.yml \
+            "$VM_USER@$VM_HOST:~/datadog-deployment/playbooks/"
 
-      - name: Run Ansible playbook on VM
-        run: |
-          ssh -o StrictHostKeyChecking=no \
-            -i ~/.ssh/id_rsa \
-            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
-            "cd ~/datadog-deployment && ansible-playbook -i inventory/hosts.ini playbooks/deploy-datadog.yml"
+          scp -o StrictHostKeyChecking=no \
+            -i "$HOME/.ssh/id_rsa" \
+            inventory/hosts.ini \
+            "$VM_USER@$VM_HOST:~/datadog-deployment/inventory/"
 
-      - name: Verify Datadog Agent
+      - name: Deploy only changed files
+        if: steps.changed.outputs.has_changes == 'true'
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        shell: bash
         run: |
-          ssh -o StrictHostKeyChecking=no \
-            -i ~/.ssh/id_rsa \
-            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
-            "sudo systemctl is-active datadog-agent"
+          set -Eeuo pipefail
+
+          while IFS= read -r changed_file; do
+            relative_path="${changed_file#datadog-ansible-vm-01/}"
+            prepared_file="deployment-files/$relative_path"
+
+            remote_source="/home/$VM_USER/datadog-staging/$relative_path"
+            remote_destination="/etc/datadog-agent/$relative_path"
+
+            echo "Deploying only: $relative_path"
+            echo "Destination: $remote_destination"
+
+            ssh -o StrictHostKeyChecking=no \
+              -i "$HOME/.ssh/id_rsa" \
+              "$VM_USER@$VM_HOST" \
+              "mkdir -p \"$(dirname "$remote_source")\""
+
+            scp -o StrictHostKeyChecking=no \
+              -i "$HOME/.ssh/id_rsa" \
+              "$prepared_file" \
+              "$VM_USER@$VM_HOST:$remote_source"
+
+            ssh -o StrictHostKeyChecking=no \
+              -i "$HOME/.ssh/id_rsa" \
+              "$VM_USER@$VM_HOST" \
+              "cd ~/datadog-deployment && \
+               ansible-playbook \
+                 -i inventory/hosts.ini \
+                 playbooks/deploy-changed-file.yml \
+                 --extra-vars \
+                 'source_file=$remote_source destination_file=$remote_destination'"
+
+          done < changed-files.txt
