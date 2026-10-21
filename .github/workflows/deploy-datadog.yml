@@ -95,6 +95,6 @@ jobs:
                  -i inventory/hosts.ini \
                  playbooks/deploy-changed-file.yml \
                  --extra-vars \
-                 'source_file=$staged_file destination_file=$destination_file'"
+                 staged_file="/home/azureuser/datadog-staging/$relative_path"
 
           done < changed-files.txt
