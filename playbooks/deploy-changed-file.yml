@@ -1,0 +1,48 @@
+---
+- name: Deploy only changed Datadog configuration file
+  hosts: datadog
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Validate input variables
+      ansible.builtin.assert:
+        that:
+          - source_file is defined
+          - destination_file is defined
+
+    - name: Create destination directory
+      ansible.builtin.file:
+        path: "{{ destination_file | dirname }}"
+        state: directory
+        owner: dd-agent
+        group: dd-agent
+        mode: "0755"
+
+    - name: Copy only changed configuration file
+      ansible.builtin.copy:
+        src: "{{ source_file }}"
+        dest: "{{ destination_file }}"
+        owner: dd-agent
+        group: dd-agent
+        mode: "0640"
+        backup: true
+      register: config_copy
+
+    - name: Validate Datadog configuration
+      ansible.builtin.command:
+        cmd: datadog-agent configcheck
+      changed_when: false
+      when: config_copy.changed
+
+    - name: Restart Datadog Agent
+      ansible.builtin.service:
+        name: datadog-agent
+        state: restarted
+      when: config_copy.changed
+
+    - name: Verify Datadog Agent
+      ansible.builtin.command:
+        cmd: systemctl is-active datadog-agent
+      changed_when: false
+      when: config_copy.changed
