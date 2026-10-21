@@ -4,24 +4,48 @@ on:
   push:
     branches:
       - main
+    paths:
+      - "datadog-ansible-vm-01/**"
+
+permissions:
+  contents: read
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup SSH Key
+      - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/id_rsa
+          printf '%s\n' "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
 
-      - name: Connect to VM
+      - name: Copy repository files to VM
         run: |
           ssh -o StrictHostKeyChecking=no \
-          -i ~/.ssh/id_rsa \
-          ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} \
-          "hostname"
+            -i ~/.ssh/id_rsa \
+            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
+            "mkdir -p ~/datadog-deployment"
+
+          scp -o StrictHostKeyChecking=no \
+            -i ~/.ssh/id_rsa \
+            -r datadog-ansible-vm-01 inventory playbooks \
+            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:~/datadog-deployment/"
+
+      - name: Run Ansible playbook on VM
+        run: |
+          ssh -o StrictHostKeyChecking=no \
+            -i ~/.ssh/id_rsa \
+            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
+            "cd ~/datadog-deployment && ansible-playbook -i inventory/hosts.ini playbooks/deploy-datadog.yml"
+
+      - name: Verify Datadog Agent
+        run: |
+          ssh -o StrictHostKeyChecking=no \
+            -i ~/.ssh/id_rsa \
+            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
+            "sudo systemctl is-active datadog-agent"
