@@ -4846,3 +4846,5 @@ site: us3.datadoghq.com
 #     #  sensitive to forward to Datadog telemetry.
 #
 #     disable_detailed_telemetry: false
+tags:
+  - github-action-test
