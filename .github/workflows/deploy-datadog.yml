@@ -4,24 +4,52 @@ on:
   push:
     branches:
       - main
+    paths:
+      - "datadog-ansible-vm-01/**"
+
+permissions:
+  contents: read
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup SSH Key
+      - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/id_rsa
+          printf '%s\n' "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
 
-      - name: Connect to VM
+      - name: Copy files to VM staging
         run: |
           ssh -o StrictHostKeyChecking=no \
-          -i ~/.ssh/id_rsa \
-          ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} \
-          "hostname"
+            -i ~/.ssh/id_rsa \
+            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
+            "mkdir -p /home/azureuser/datadog-staging/conf.d/http_check.d"
+
+          scp -o StrictHostKeyChecking=no \
+            -i ~/.ssh/id_rsa \
+            datadog-ansible-vm-01/conf.d/http_check.d/conf.yaml \
+            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/home/azureuser/datadog-staging/conf.d/http_check.d/conf.yaml"
+
+      - name: Run Ansible Playbook
+        run: |
+          ssh -o StrictHostKeyChecking=no \
+            -i ~/.ssh/id_rsa \
+            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
+            "cd ~/datadog-deployment && \
+             ansible-playbook \
+             -i inventory/hosts.ini \
+             playbooks/deploy-changed-file.yml \
+             --extra-vars 'source_file=/home/azureuser/datadog-staging/conf.d/http_check.d/conf.yaml destination_file=/etc/datadog-agent/conf.d/http_check.d/conf.yaml'"
+
+      - name: Verify Deployment
+        run: |
+          ssh -o StrictHostKeyChecking=no \
+            -i ~/.ssh/id_rsa \
+            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
+            "sudo cat /etc/datadog-agent/conf.d/http_check.d/conf.yaml"
