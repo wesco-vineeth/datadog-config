@@ -6,7 +6,7 @@
 
     - name: Copy datadog.yaml
       copy:
-        src: ../datadog.yaml
+        src: ../datadog-ansible-vm-01/datadog.yaml
         dest: /etc/datadog-agent/datadog.yaml
 
     - name: Validate Datadog config
