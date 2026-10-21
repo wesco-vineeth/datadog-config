@@ -1,0 +1,18 @@
+---
+- name: Deploy Datadog Configuration
+  hosts: datadog
+  become: true
+
+  tasks:
+    - name: Copy datadog.yaml
+      copy:
+        src: ../datadog-ansible-vm-01/datadog.yaml
+        dest: /etc/datadog-agent/datadog.yaml
+        owner: dd-agent
+        group: dd-agent
+        mode: '0640'
+
+    - name: Restart Datadog Agent
+      service:
+        name: datadog-agent
+        state: restarted
