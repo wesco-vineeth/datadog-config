@@ -1,0 +1,6 @@
+init_config:
+
+instances:
+  - name: Test HTTP Check
+    url: https://example.com
+    timeout: 40
