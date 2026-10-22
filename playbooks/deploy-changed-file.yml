@@ -1,7 +1,7 @@
 ---
 - name: Create, update, or delete Datadog configuration
   hosts: datadog
-  become: true
+  become: false
   gather_facts: false
 
   vars:
