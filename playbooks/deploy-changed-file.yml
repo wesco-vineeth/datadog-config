@@ -1,15 +1,27 @@
 ---
-- name: Deploy only changed Datadog configuration file
+- name: Create, update, or delete Datadog configuration
   hosts: datadog
   become: true
   gather_facts: false
 
+  vars:
+    desired_state: "present"
+    source_file: ""
+
   tasks:
-    - name: Validate input variables
+    - name: Validate deployment inputs
       ansible.builtin.assert:
         that:
-          - source_file is defined
+          - desired_state in ["present", "absent"]
           - destination_file is defined
+          - destination_file.startswith("/etc/datadog-agent/")
+          - "'..' not in destination_file"
+
+    - name: Validate source file for create or update
+      ansible.builtin.assert:
+        that:
+          - source_file | length > 0
+      when: desired_state == "present"
 
     - name: Create destination directory
       ansible.builtin.file:
@@ -18,31 +30,49 @@
         owner: dd-agent
         group: dd-agent
         mode: "0755"
+      when: desired_state == "present"
 
-    - name: Copy only changed configuration file
+    - name: Create or update changed file
       ansible.builtin.copy:
         src: "{{ source_file }}"
         dest: "{{ destination_file }}"
+        remote_src: true
         owner: dd-agent
         group: dd-agent
         mode: "0640"
         backup: true
-      register: config_copy
+      register: copy_result
+      when: desired_state == "present"
+
+    - name: Delete removed configuration file
+      ansible.builtin.file:
+        path: "{{ destination_file }}"
+        state: absent
+      register: delete_result
+      when: desired_state == "absent"
+
+    - name: Check whether configuration changed
+      ansible.builtin.set_fact:
+        config_changed: >-
+          {{
+            (copy_result.changed | default(false)) or
+            (delete_result.changed | default(false))
+          }}
 
     - name: Validate Datadog configuration
       ansible.builtin.command:
         cmd: datadog-agent configcheck
       changed_when: false
-      when: config_copy.changed
+      when: config_changed
 
     - name: Restart Datadog Agent
       ansible.builtin.service:
         name: datadog-agent
         state: restarted
-      when: config_copy.changed
+      when: config_changed
 
     - name: Verify Datadog Agent
       ansible.builtin.command:
         cmd: systemctl is-active datadog-agent
       changed_when: false
-      when: config_copy.changed
+      when: config_changed
