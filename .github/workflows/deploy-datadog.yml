@@ -1,4 +1,4 @@
-name: Deploy Changed Datadog Config
+name: Synchronize Datadog Config
 
 on:
   push:
@@ -6,88 +6,176 @@ on:
       - main
     paths:
       - "datadog-ansible-vm-01/**"
+      - "playbooks/deploy-changed-file.yml"
+      - "inventory/hosts.ini"
+      - ".github/workflows/deploy-datadog.yml"
 
 permissions:
   contents: read
 
+concurrency:
+  group: datadog-vm-01-deployment
+  cancel-in-progress: false
+
 jobs:
-  deploy:
+  synchronize:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Configure SSH
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
         run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
+          set -Eeuo pipefail
 
-      - name: Detect changed configuration files
-        id: changed
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VM_SSH_KEY" > "$HOME/.ssh/id_rsa"
+          chmod 600 "$HOME/.ssh/id_rsa"
+
+      - name: Detect added, modified, and deleted files
+        id: changes
+        shell: bash
         run: |
-          git diff --name-only --diff-filter=AM HEAD^ HEAD \
-            -- "datadog-ansible-vm-01/**" \
-            | grep -E '\.ya?ml$' > changed-files.txt || true
+          set -Eeuo pipefail
 
-          if [ -s changed-files.txt ]; then
-            echo "has_changes=true" >> $GITHUB_OUTPUT
+          BEFORE="${{ github.event.before }}"
+          CURRENT="${{ github.sha }}"
+
+          if [[ -z "$BEFORE" || \
+                "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
+            BEFORE="${CURRENT}^"
+          fi
+
+          git diff --name-only --diff-filter=AM \
+            "$BEFORE" "$CURRENT" \
+            -- "datadog-ansible-vm-01/" \
+            | grep -E '\.ya?ml$' > present-files.txt || true
+
+          git diff --name-only --diff-filter=D \
+            "$BEFORE" "$CURRENT" \
+            -- "datadog-ansible-vm-01/" \
+            | grep -E '\.ya?ml$' > deleted-files.txt || true
+
+          echo "Added or modified files:"
+          cat present-files.txt
+
+          echo "Deleted files:"
+          cat deleted-files.txt
+
+          if [[ -s present-files.txt || -s deleted-files.txt ]]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
           else
-            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Copy playbook and inventory to VM
-        if: steps.changed.outputs.has_changes == 'true'
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
         run: |
+          set -Eeuo pipefail
+
+          REMOTE_HOME="/home/$VM_USER"
+
           ssh -o StrictHostKeyChecking=no \
-            -i ~/.ssh/id_rsa \
-            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
-            "mkdir -p ~/datadog-deployment/playbooks \
-                      ~/datadog-deployment/inventory \
-                      /home/azureuser/datadog-staging"
+            -i "$HOME/.ssh/id_rsa" \
+            "$VM_USER@$VM_HOST" \
+            "mkdir -p \
+              '$REMOTE_HOME/datadog-deployment/playbooks' \
+              '$REMOTE_HOME/datadog-deployment/inventory' \
+              '$REMOTE_HOME/datadog-staging'"
 
           scp -o StrictHostKeyChecking=no \
-            -i ~/.ssh/id_rsa \
+            -i "$HOME/.ssh/id_rsa" \
             playbooks/deploy-changed-file.yml \
-            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:~/datadog-deployment/playbooks/"
+            "$VM_USER@$VM_HOST:$REMOTE_HOME/datadog-deployment/playbooks/"
 
           scp -o StrictHostKeyChecking=no \
-            -i ~/.ssh/id_rsa \
+            -i "$HOME/.ssh/id_rsa" \
             inventory/hosts.ini \
-            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:~/datadog-deployment/inventory/"
+            "$VM_USER@$VM_HOST:$REMOTE_HOME/datadog-deployment/inventory/"
 
-      - name: Deploy only changed files
-        if: steps.changed.outputs.has_changes == 'true'
+      - name: Create or update changed files
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        shell: bash
         run: |
+          set -Eeuo pipefail
+
+          REMOTE_HOME="/home/$VM_USER"
+
           while IFS= read -r changed_file; do
+            [[ -z "$changed_file" ]] && continue
 
             relative_path="${changed_file#datadog-ansible-vm-01/}"
+            remote_source="$REMOTE_HOME/datadog-staging/$relative_path"
+            destination_file="/etc/datadog-agent/$relative_path"
 
-            staged_file="/home/azureuser/datadog-staging/$relative_path"
+            echo "Creating or updating: $destination_file"
+
+            ssh -o StrictHostKeyChecking=no \
+              -i "$HOME/.ssh/id_rsa" \
+              "$VM_USER@$VM_HOST" \
+              "mkdir -p '$(dirname "$remote_source")'"
+
+            scp -o StrictHostKeyChecking=no \
+              -i "$HOME/.ssh/id_rsa" \
+              "$changed_file" \
+              "$VM_USER@$VM_HOST:$remote_source"
+
+            ssh -o StrictHostKeyChecking=no \
+              -i "$HOME/.ssh/id_rsa" \
+              "$VM_USER@$VM_HOST" \
+              "cd '$REMOTE_HOME/datadog-deployment' && \
+               ansible-playbook \
+                 -i inventory/hosts.ini \
+                 playbooks/deploy-changed-file.yml \
+                 --extra-vars \
+                 'desired_state=present source_file=$remote_source destination_file=$destination_file'"
+
+          done < present-files.txt
+
+      - name: Delete files removed from GitHub
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          REMOTE_HOME="/home/$VM_USER"
+
+          while IFS= read -r deleted_file; do
+            [[ -z "$deleted_file" ]] && continue
+
+            relative_path="${deleted_file#datadog-ansible-vm-01/}"
+
+            if [[ "$relative_path" == "datadog.yaml" ]]; then
+              echo "::error::Deletion of datadog.yaml is blocked."
+              exit 1
+            fi
 
             destination_file="/etc/datadog-agent/$relative_path"
 
-            ssh -o StrictHostKeyChecking=no \
-              -i ~/.ssh/id_rsa \
-              "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
-              "mkdir -p \$(dirname $staged_file)"
-
-            scp -o StrictHostKeyChecking=no \
-              -i ~/.ssh/id_rsa \
-              "$changed_file" \
-              "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:$staged_file"
+            echo "Deleting from VM: $destination_file"
 
             ssh -o StrictHostKeyChecking=no \
-              -i ~/.ssh/id_rsa \
-              "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
-              "cd ~/datadog-deployment && \
+              -i "$HOME/.ssh/id_rsa" \
+              "$VM_USER@$VM_HOST" \
+              "cd '$REMOTE_HOME/datadog-deployment' && \
                ansible-playbook \
-               -i inventory/hosts.ini \
-               playbooks/deploy-changed-file.yml \
-               --extra-vars \
-               'source_file=$staged_file destination_file=$destination_file'"
+                 -i inventory/hosts.ini \
+                 playbooks/deploy-changed-file.yml \
+                 --extra-vars \
+                 'desired_state=absent destination_file=$destination_file'"
 
-          done < changed-files.txt
+          done < deleted-files.txt
