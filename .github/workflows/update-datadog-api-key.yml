@@ -1,0 +1,98 @@
+name: Update Datadog API Key
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  update-api-key:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+        run: |
+          set -Eeuo pipefail
+
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VM_SSH_KEY" > "$HOME/.ssh/id_rsa"
+          chmod 600 "$HOME/.ssh/id_rsa"
+
+      - name: Prepare API key securely
+        env:
+          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+        run: |
+          set -Eeuo pipefail
+
+          test -n "$DATADOG_API_KEY"
+          printf '%s' "$DATADOG_API_KEY" > "$RUNNER_TEMP/datadog-api-key"
+          chmod 600 "$RUNNER_TEMP/datadog-api-key"
+
+      - name: Copy secret and deployment files to VM
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
+          set -Eeuo pipefail
+
+          REMOTE_HOME="/home/$VM_USER"
+
+          ssh -o StrictHostKeyChecking=no \
+            -i "$HOME/.ssh/id_rsa" \
+            "$VM_USER@$VM_HOST" \
+            "mkdir -p \
+              '$REMOTE_HOME/datadog-secret' \
+              '$REMOTE_HOME/datadog-deployment/playbooks' \
+              '$REMOTE_HOME/datadog-deployment/inventory' && \
+             chmod 700 '$REMOTE_HOME/datadog-secret'"
+
+          scp -o StrictHostKeyChecking=no \
+            -i "$HOME/.ssh/id_rsa" \
+            "$RUNNER_TEMP/datadog-api-key" \
+            "$VM_USER@$VM_HOST:$REMOTE_HOME/datadog-secret/api_key"
+
+          scp -o StrictHostKeyChecking=no \
+            -i "$HOME/.ssh/id_rsa" \
+            playbooks/update-datadog-api-key.yml \
+            "$VM_USER@$VM_HOST:$REMOTE_HOME/datadog-deployment/playbooks/"
+
+          scp -o StrictHostKeyChecking=no \
+            -i "$HOME/.ssh/id_rsa" \
+            inventory/hosts.ini \
+            "$VM_USER@$VM_HOST:$REMOTE_HOME/datadog-deployment/inventory/"
+
+          ssh -o StrictHostKeyChecking=no \
+            -i "$HOME/.ssh/id_rsa" \
+            "$VM_USER@$VM_HOST" \
+            "chmod 600 '$REMOTE_HOME/datadog-secret/api_key'"
+
+      - name: Update Datadog API key
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
+          set -Eeuo pipefail
+
+          ssh -o StrictHostKeyChecking=no \
+            -i "$HOME/.ssh/id_rsa" \
+            "$VM_USER@$VM_HOST" \
+            "cd /home/$VM_USER/datadog-deployment && \
+             ansible-playbook \
+               -i inventory/hosts.ini \
+               playbooks/update-datadog-api-key.yml"
+
+      - name: Verify Datadog Agent
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
+          ssh -o StrictHostKeyChecking=no \
+            -i "$HOME/.ssh/id_rsa" \
+            "$VM_USER@$VM_HOST" \
+            "sudo systemctl is-active datadog-agent"
