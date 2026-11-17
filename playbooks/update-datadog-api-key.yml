@@ -36,7 +36,7 @@
     - name: Update API key in datadog.yaml
       ansible.builtin.lineinfile:
         path: /etc/datadog-agent/datadog.yaml
-        regexp: '^[[:space:]]*api_key:'
+        regexp: '^api_key:.*$'
         line: "api_key: {{ datadog_api_key }}"
         owner: dd-agent
         group: dd-agent
