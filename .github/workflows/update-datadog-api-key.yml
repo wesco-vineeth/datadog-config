@@ -26,7 +26,7 @@ jobs:
 
       - name: Prepare API key securely
         env:
-          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY_NEW}}
         run: |
           set -Eeuo pipefail
 
