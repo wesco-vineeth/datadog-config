@@ -40,7 +40,6 @@
         owner: dd-agent
         group: dd-agent
         mode: "0640"
-        backup: true
       register: copy_result
       when: desired_state == "present"
 
