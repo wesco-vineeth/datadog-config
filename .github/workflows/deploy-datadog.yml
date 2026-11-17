@@ -53,12 +53,12 @@ jobs:
 
           git diff --name-only --diff-filter=AM \
             "$BEFORE" "$CURRENT" \
-            -- "datadog-ansible-vm-01/" \
+            -- "datadog-ansible-vm-01/conf.d/" \
             | grep -E '\.ya?ml$' > present-files.txt || true
 
           git diff --name-only --diff-filter=D \
             "$BEFORE" "$CURRENT" \
-            -- "datadog-ansible-vm-01/" \
+            -- "datadog-ansible-vm-01/conf.d/" \
             | grep -E '\.ya?ml$' > deleted-files.txt || true
 
           echo "Added or modified files:"
