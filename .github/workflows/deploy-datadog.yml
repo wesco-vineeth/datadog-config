@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - "datadog-ansible-vm-01/**"
+      - "datadog-ansible-vm-01/conf.d/**"
       - "playbooks/deploy-changed-file.yml"
       - "inventory/hosts.ini"
       - ".github/workflows/deploy-datadog.yml"
