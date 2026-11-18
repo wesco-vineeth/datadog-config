@@ -4,12 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       target_vm:
-        description: "Select the VM to update"
+        description: "VM folder name to update (e.g. datadog-ansible-vm-01)"
         required: true
-        type: choice
-        options:
-          - test-vm-01
-          - prod-vm-02
+        type: string
 
 permissions:
   contents: read
@@ -20,8 +17,8 @@ jobs:
 
     env:
       VM_USER: ${{ secrets.VM_USER }}
-      VM_01_HOST: ${{ secrets.VM_HOST }}
-      VM_02_HOST: ${{ secrets.VM02_HOST }}
+      # Optional JSON map of VM folder name -> host/IP override
+      VM_HOSTS: ${{ secrets.VM_HOSTS }}
 
     steps:
       - name: Checkout repository
@@ -40,27 +37,24 @@ jobs:
       - name: Select target VM
         id: target
         shell: bash
+        env:
+          TARGET_VM: ${{ inputs.target_vm }}
         run: |
           set -Eeuo pipefail
 
-          case "${{ inputs.target_vm }}" in
+          if [[ ! "$TARGET_VM" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Invalid VM name: $TARGET_VM"
+            exit 1
+          fi
 
-            test-vm-01)
-              echo "vm_host=$VM_01_HOST" >> "$GITHUB_OUTPUT"
-              echo "vm_name=datadog-ansible-vm-01" >> "$GITHUB_OUTPUT"
-              ;;
+          host=""
+          if [[ -n "${VM_HOSTS:-}" ]]; then
+            host="$(jq -r --arg vm "$TARGET_VM" '.[$vm] // empty' <<< "$VM_HOSTS")"
+          fi
 
-            prod-vm-02)
-              echo "vm_host=$VM_02_HOST" >> "$GITHUB_OUTPUT"
-              echo "vm_name=datadog-ansible-vm-02" >> "$GITHUB_OUTPUT"
-              ;;
-
-            *)
-              echo "Unsupported VM"
-              exit 1
-              ;;
-
-          esac
+          # VM_HOSTS override if present, otherwise the VM name is the hostname
+          echo "vm_host=${host:-$TARGET_VM}" >> "$GITHUB_OUTPUT"
+          echo "vm_name=$TARGET_VM" >> "$GITHUB_OUTPUT"
 
       - name: Prepare API key securely
         env:

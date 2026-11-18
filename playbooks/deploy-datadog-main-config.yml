@@ -11,6 +11,40 @@
           - source_file is defined
           - source_file | length > 0
 
+    - name: Check existing datadog.yaml on the server
+      ansible.builtin.stat:
+        path: /etc/datadog-agent/datadog.yaml
+      register: current_config
+
+    - name: Read existing datadog.yaml
+      ansible.builtin.slurp:
+        src: /etc/datadog-agent/datadog.yaml
+      register: current_config_content
+      when: current_config.stat.exists
+      no_log: true
+
+    - name: Find the api_key line currently on the server
+      ansible.builtin.set_fact:
+        preserved_api_key_line: >-
+          {{
+            (current_config_content.content | b64decode)
+            | regex_search('(?m)^api_key:.*$')
+            | default('', true)
+          }}
+      when: current_config.stat.exists
+      no_log: true
+
+    - name: Keep the server's api_key in the staged file
+      ansible.builtin.lineinfile:
+        path: "{{ source_file }}"
+        regexp: '^api_key:.*$'
+        line: "{{ preserved_api_key_line }}"
+        backup: false
+      when:
+        - current_config.stat.exists
+        - preserved_api_key_line | default('') | length > 0
+      no_log: true
+
     - name: Deploy datadog.yaml
       ansible.builtin.copy:
         src: "{{ source_file }}"
