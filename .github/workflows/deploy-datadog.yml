@@ -101,7 +101,7 @@ jobs:
           SSH_OPTS=(-o StrictHostKeyChecking=no -i "$HOME/.ssh/id_rsa")
           REMOTE_HOME="/home/$VM_USER"
 
-          while IFS= read -r changed_file; do
+          while IFS= read -r -u 3 changed_file; do
             [[ -z "$changed_file" ]] && continue
 
             # azure/<application>/<environment>/<vm_name>/conf.d/...
@@ -150,7 +150,7 @@ jobs:
                  --extra-vars \
                  'desired_state=present source_file=$remote_source destination_file=$destination_file'"
 
-          done < present-files.txt
+          done 3< present-files.txt
 
       - name: Delete removed files
         if: steps.changes.outputs.has_changes == 'true'
@@ -176,7 +176,7 @@ jobs:
           SSH_OPTS=(-o StrictHostKeyChecking=no -i "$HOME/.ssh/id_rsa")
           REMOTE_HOME="/home/$VM_USER"
 
-          while IFS= read -r deleted_file; do
+          while IFS= read -r -u 3 deleted_file; do
             [[ -z "$deleted_file" ]] && continue
 
             application="$(echo "$deleted_file" | cut -d/ -f2)"
@@ -217,4 +217,4 @@ jobs:
                  --extra-vars \
                  'desired_state=absent destination_file=$destination_file'"
 
-          done < deleted-files.txt
+          done 3< deleted-files.txt
