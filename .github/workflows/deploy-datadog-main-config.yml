@@ -7,7 +7,7 @@ on:
     types:
       - closed
     paths:
-      - "datadog-ansible-vm-01/datadog.yaml"
+      - "azure/test/application-a/datadog-ansible-vm-01/datadog.yaml"
 
 permissions:
   contents: read
@@ -52,7 +52,7 @@ jobs:
           from pathlib import Path
 
           source = Path(
-              "datadog-ansible-vm-01/datadog.yaml"
+              "azure/test/application-a/datadog-ansible-vm-01/datadog.yaml"
           )
 
           destination = Path(
