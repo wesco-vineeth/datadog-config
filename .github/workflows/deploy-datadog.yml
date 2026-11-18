@@ -56,7 +56,7 @@ jobs:
             "$BASE" "$MERGE" \
             -- \
             ':(glob)azure/*/*/*/conf.d/**' \
-            | grep -E '\.ya?ml$' > present-files.txt || true
+            | grep -E '(\.ya?ml|/\.gitkeep)$' > present-files.txt || true
 
           git diff --name-only --diff-filter=D \
             "$BASE" "$MERGE" \

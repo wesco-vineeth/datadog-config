@@ -23,7 +23,7 @@
           - source_file | length > 0
       when: desired_state == "present"
 
-    - name: Create destination directory
+    - name: Create destination directory if it does not exist
       ansible.builtin.file:
         path: "{{ destination_file | dirname }}"
         state: directory
@@ -32,7 +32,7 @@
         mode: "0755"
       when: desired_state == "present"
 
-    - name: Create or update changed file
+    - name: Create file if missing or update if changed
       ansible.builtin.copy:
         src: "{{ source_file }}"
         dest: "{{ destination_file }}"
@@ -41,7 +41,9 @@
         group: dd-agent
         mode: "0640"
       register: copy_result
-      when: desired_state == "present"
+      when:
+        - desired_state == "present"
+        - (destination_file | basename) != ".gitkeep"
 
     - name: Delete removed configuration file
       ansible.builtin.file:
