@@ -7,7 +7,7 @@ on:
     types:
       - closed
     paths:
-      - "datadog-ansible-vm-01/conf.d/**"
+      - "azure/test/application-a/datadog-ansible-vm-01/conf.d/**"
 
 permissions:
   contents: read
@@ -49,12 +49,12 @@ jobs:
 
           git diff --name-only --diff-filter=AM \
             "$BASE" "$MERGE" \
-            -- "datadog-ansible-vm-01/conf.d/" \
+            -- "azure/test/application-a/datadog-ansible-vm-01/conf.d/" \
             | grep -E '\.ya?ml$' > present-files.txt || true
 
           git diff --name-only --diff-filter=D \
             "$BASE" "$MERGE" \
-            -- "datadog-ansible-vm-01/conf.d/" \
+            -- "azure/test/application-a/datadog-ansible-vm-01/conf.d/" \
             | grep -E '\.ya?ml$' > deleted-files.txt || true
 
           echo "Added or modified files:"
@@ -111,7 +111,7 @@ jobs:
           while IFS= read -r changed_file; do
             [[ -z "$changed_file" ]] && continue
 
-            relative_path="${changed_file#datadog-ansible-vm-01/}"
+            relative_path="${changed_file#azure/test/application-a/datadog-ansible-vm-01/}"
             remote_source="$REMOTE_HOME/datadog-staging/$relative_path"
             destination_file="/etc/datadog-agent/$relative_path"
 
@@ -153,7 +153,7 @@ jobs:
           while IFS= read -r deleted_file; do
             [[ -z "$deleted_file" ]] && continue
 
-            relative_path="${deleted_file#datadog-ansible-vm-01/}"
+            relative_path="${deleted_file#azure/test/application-a/datadog-ansible-vm-01/}"
             destination_file="/etc/datadog-agent/$relative_path"
 
             echo "Deleting: $destination_file"
