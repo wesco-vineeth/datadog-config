@@ -8,18 +8,24 @@ on:
       - closed
     paths:
       - "azure/application-a/test/datadog-ansible-vm-01/conf.d/**"
+      - "azure/application-a/prod/datadog-ansible-vm-02/conf.d/**"
 
 permissions:
   contents: read
 
 concurrency:
-  group: datadog-vm-01-conf-deployment
+  group: datadog-conf-deployment
   cancel-in-progress: false
 
 jobs:
   synchronize:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
+
+    env:
+      VM_USER: ${{ secrets.VM_USER }}
+      VM_01_HOST: ${{ secrets.VM_HOST }}
+      VM_02_HOST: ${{ secrets.VM02_HOST }}
 
     steps:
       - name: Checkout merged main branch
@@ -49,19 +55,23 @@ jobs:
 
           git diff --name-only --diff-filter=AM \
             "$BASE" "$MERGE" \
-            -- "azure/application-a/test/datadog-ansible-vm-01/conf.d/" \
+            -- \
+            "azure/application-a/test/datadog-ansible-vm-01/conf.d/" \
+            "azure/application-a/prod/datadog-ansible-vm-02/conf.d/" \
             | grep -E '\.ya?ml$' > present-files.txt || true
 
           git diff --name-only --diff-filter=D \
             "$BASE" "$MERGE" \
-            -- "azure/application-a/test/datadog-ansible-vm-01/conf.d/" \
+            -- \
+            "azure/application-a/test/datadog-ansible-vm-01/conf.d/" \
+            "azure/application-a/prod/datadog-ansible-vm-02/conf.d/" \
             | grep -E '\.ya?ml$' > deleted-files.txt || true
 
           echo "Added or modified files:"
-          cat present-files.txt
+          cat present-files.txt || true
 
           echo "Deleted files:"
-          cat deleted-files.txt
+          cat deleted-files.txt || true
 
           if [[ -s present-files.txt || -s deleted-files.txt ]]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
@@ -69,67 +79,82 @@ jobs:
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Copy Ansible files to VM
+      - name: Deploy added or modified files
         if: steps.changes.outputs.has_changes == 'true'
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-        run: |
-          set -Eeuo pipefail
-
-          REMOTE_HOME="/home/$VM_USER"
-
-          ssh -o StrictHostKeyChecking=no \
-            -i "$HOME/.ssh/id_rsa" \
-            "$VM_USER@$VM_HOST" \
-            "mkdir -p \
-              '$REMOTE_HOME/datadog-deployment/playbooks' \
-              '$REMOTE_HOME/datadog-deployment/inventory' \
-              '$REMOTE_HOME/datadog-staging'"
-
-          scp -o StrictHostKeyChecking=no \
-            -i "$HOME/.ssh/id_rsa" \
-            playbooks/deploy-changed-file.yml \
-            "$VM_USER@$VM_HOST:$REMOTE_HOME/datadog-deployment/playbooks/"
-
-          scp -o StrictHostKeyChecking=no \
-            -i "$HOME/.ssh/id_rsa" \
-            inventory/hosts.ini \
-            "$VM_USER@$VM_HOST:$REMOTE_HOME/datadog-deployment/inventory/"
-
-      - name: Create or update changed files
-        if: steps.changes.outputs.has_changes == 'true'
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          REMOTE_HOME="/home/$VM_USER"
-
           while IFS= read -r changed_file; do
             [[ -z "$changed_file" ]] && continue
 
-            relative_path="${changed_file#azure/application-a/test/datadog-ansible-vm-01/}"
+            environment="$(echo "$changed_file" | cut -d/ -f3)"
+            vm_name="$(echo "$changed_file" | cut -d/ -f4)"
+            relative_path="$(echo "$changed_file" | cut -d/ -f5-)"
+
+            case "$environment/$vm_name" in
+              test/datadog-ansible-vm-01)
+                VM_HOST_SELECTED="$VM_01_HOST"
+                ;;
+
+              prod/datadog-ansible-vm-02)
+                VM_HOST_SELECTED="$VM_02_HOST"
+                ;;
+
+              *)
+                echo "Unsupported target: $environment/$vm_name"
+                exit 1
+                ;;
+            esac
+
+            if [[ -z "$VM_HOST_SELECTED" ]]; then
+              echo "VM host is empty for $environment/$vm_name"
+              exit 1
+            fi
+
+            REMOTE_HOME="/home/$VM_USER"
+
             remote_source="$REMOTE_HOME/datadog-staging/$relative_path"
             destination_file="/etc/datadog-agent/$relative_path"
 
-            echo "Deploying: $relative_path"
+            echo "======================================"
+            echo "Environment : $environment"
+            echo "VM          : $vm_name"
+            echo "File        : $relative_path"
+            echo "Destination : $destination_file"
+            echo "======================================"
 
-            ssh -o StrictHostKeyChecking=no \
+            ssh \
+              -o StrictHostKeyChecking=no \
               -i "$HOME/.ssh/id_rsa" \
-              "$VM_USER@$VM_HOST" \
-              "mkdir -p '$(dirname "$remote_source")'"
+              "$VM_USER@$VM_HOST_SELECTED" \
+              "mkdir -p \
+                '$REMOTE_HOME/datadog-deployment/playbooks' \
+                '$REMOTE_HOME/datadog-deployment/inventory' \
+                '$(dirname "$remote_source")'"
 
-            scp -o StrictHostKeyChecking=no \
+            scp \
+              -o StrictHostKeyChecking=no \
+              -i "$HOME/.ssh/id_rsa" \
+              playbooks/deploy-changed-file.yml \
+              "$VM_USER@$VM_HOST_SELECTED:$REMOTE_HOME/datadog-deployment/playbooks/"
+
+            scp \
+              -o StrictHostKeyChecking=no \
+              -i "$HOME/.ssh/id_rsa" \
+              inventory/hosts.ini \
+              "$VM_USER@$VM_HOST_SELECTED:$REMOTE_HOME/datadog-deployment/inventory/"
+
+            scp \
+              -o StrictHostKeyChecking=no \
               -i "$HOME/.ssh/id_rsa" \
               "$changed_file" \
-              "$VM_USER@$VM_HOST:$remote_source"
+              "$VM_USER@$VM_HOST_SELECTED:$remote_source"
 
-            ssh -o StrictHostKeyChecking=no \
+            ssh \
+              -o StrictHostKeyChecking=no \
               -i "$HOME/.ssh/id_rsa" \
-              "$VM_USER@$VM_HOST" \
+              "$VM_USER@$VM_HOST_SELECTED" \
               "cd '$REMOTE_HOME/datadog-deployment' && \
                ansible-playbook \
                  -i inventory/hosts.ini \
@@ -141,26 +166,70 @@ jobs:
 
       - name: Delete removed files
         if: steps.changes.outputs.has_changes == 'true'
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          REMOTE_HOME="/home/$VM_USER"
-
           while IFS= read -r deleted_file; do
             [[ -z "$deleted_file" ]] && continue
 
-            relative_path="${deleted_file#azure/application-a/test/datadog-ansible-vm-01/}"
+            environment="$(echo "$deleted_file" | cut -d/ -f3)"
+            vm_name="$(echo "$deleted_file" | cut -d/ -f4)"
+            relative_path="$(echo "$deleted_file" | cut -d/ -f5-)"
+
+            case "$environment/$vm_name" in
+              test/datadog-ansible-vm-01)
+                VM_HOST_SELECTED="$VM_01_HOST"
+                ;;
+
+              prod/datadog-ansible-vm-02)
+                VM_HOST_SELECTED="$VM_02_HOST"
+                ;;
+
+              *)
+                echo "Unsupported target: $environment/$vm_name"
+                exit 1
+                ;;
+            esac
+
+            if [[ -z "$VM_HOST_SELECTED" ]]; then
+              echo "VM host is empty for $environment/$vm_name"
+              exit 1
+            fi
+
+            REMOTE_HOME="/home/$VM_USER"
             destination_file="/etc/datadog-agent/$relative_path"
 
-            echo "Deleting: $destination_file"
+            echo "======================================"
+            echo "Environment : $environment"
+            echo "VM          : $vm_name"
+            echo "Deleting    : $destination_file"
+            echo "======================================"
 
-            ssh -o StrictHostKeyChecking=no \
+            ssh \
+              -o StrictHostKeyChecking=no \
               -i "$HOME/.ssh/id_rsa" \
-              "$VM_USER@$VM_HOST" \
+              "$VM_USER@$VM_HOST_SELECTED" \
+              "mkdir -p \
+                '$REMOTE_HOME/datadog-deployment/playbooks' \
+                '$REMOTE_HOME/datadog-deployment/inventory'"
+
+            scp \
+              -o StrictHostKeyChecking=no \
+              -i "$HOME/.ssh/id_rsa" \
+              playbooks/deploy-changed-file.yml \
+              "$VM_USER@$VM_HOST_SELECTED:$REMOTE_HOME/datadog-deployment/playbooks/"
+
+            scp \
+              -o StrictHostKeyChecking=no \
+              -i "$HOME/.ssh/id_rsa" \
+              inventory/hosts.ini \
+              "$VM_USER@$VM_HOST_SELECTED:$REMOTE_HOME/datadog-deployment/inventory/"
+
+            ssh \
+              -o StrictHostKeyChecking=no \
+              -i "$HOME/.ssh/id_rsa" \
+              "$VM_USER@$VM_HOST_SELECTED" \
               "cd '$REMOTE_HOME/datadog-deployment' && \
                ansible-playbook \
                  -i inventory/hosts.ini \
