@@ -8,18 +8,28 @@ on:
       - closed
     paths:
       - "azure/application-a/test/datadog-ansible-vm-01/datadog.yaml"
+      - "azure/application-a/prod/datadog-ansible-vm-02/datadog.yaml"
 
 permissions:
   contents: read
 
 concurrency:
-  group: datadog-vm-01-main-config
+  group: datadog-main-config-deployment
   cancel-in-progress: false
 
 jobs:
   deploy-main-config:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
+
+    env:
+      VM_USER: ${{ secrets.VM_USER }}
+
+      VM_01_HOST: ${{ secrets.VM_HOST }}
+      VM_02_HOST: ${{ secrets.VM02_HOST }}
+
+      VM_01_DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+      VM_02_DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY_OLD }}
 
     steps:
       - name: Checkout merged main branch
@@ -38,35 +48,106 @@ jobs:
           printf '%s\n' "$VM_SSH_KEY" > "$HOME/.ssh/id_rsa"
           chmod 600 "$HOME/.ssh/id_rsa"
 
-      - name: Render datadog.yaml securely
-        env:
-          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+      - name: Detect changed datadog.yaml files
+        id: changes
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          test -n "$DATADOG_API_KEY"
+          BASE="${{ github.event.pull_request.base.sha }}"
+          MERGE="${{ github.event.pull_request.merge_commit_sha }}"
 
-          python3 - <<'PY'
+          git diff --name-only --diff-filter=AM \
+            "$BASE" "$MERGE" \
+            -- \
+            "azure/application-a/test/datadog-ansible-vm-01/datadog.yaml" \
+            "azure/application-a/prod/datadog-ansible-vm-02/datadog.yaml" \
+            > changed-main-configs.txt
+
+          echo "Changed main configuration files:"
+          cat changed-main-configs.txt || true
+
+          if [[ -s changed-main-configs.txt ]]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy changed datadog.yaml files
+        if: steps.changes.outputs.has_changes == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          while IFS= read -r source_file; do
+            [[ -z "$source_file" ]] && continue
+
+            application="$(echo "$source_file" | cut -d/ -f2)"
+            environment="$(echo "$source_file" | cut -d/ -f3)"
+            vm_name="$(echo "$source_file" | cut -d/ -f4)"
+
+            case "$environment/$vm_name" in
+              test/datadog-ansible-vm-01)
+                VM_HOST_SELECTED="$VM_01_HOST"
+                DATADOG_API_KEY_SELECTED="$VM_01_DATADOG_API_KEY"
+                ;;
+
+              prod/datadog-ansible-vm-02)
+                VM_HOST_SELECTED="$VM_02_HOST"
+                DATADOG_API_KEY_SELECTED="$VM_02_DATADOG_API_KEY"
+                ;;
+
+              *)
+                echo "Unsupported target: $environment/$vm_name"
+                exit 1
+                ;;
+            esac
+
+            if [[ -z "$VM_HOST_SELECTED" ]]; then
+              echo "VM host is empty for $environment/$vm_name"
+              exit 1
+            fi
+
+            if [[ -z "$DATADOG_API_KEY_SELECTED" ]]; then
+              echo "Datadog API key is empty for $environment/$vm_name"
+              exit 1
+            fi
+
+            echo "======================================"
+            echo "Application : $application"
+            echo "Environment : $environment"
+            echo "VM          : $vm_name"
+            echo "Source      : $source_file"
+            echo "======================================"
+
+            rendered_directory="$RUNNER_TEMP/$vm_name"
+            rendered_file="$rendered_directory/datadog.yaml"
+
+            mkdir -p "$rendered_directory"
+
+            SOURCE_FILE="$source_file" \
+            DESTINATION_FILE="$rendered_file" \
+            DATADOG_API_KEY="$DATADOG_API_KEY_SELECTED" \
+            python3 - <<'PY'
           import os
           from pathlib import Path
 
-          source = Path(
-              "azure/application-a/test/datadog-ansible-vm-01/datadog.yaml"
-          )
+          source = Path(os.environ["SOURCE_FILE"])
+          destination = Path(os.environ["DESTINATION_FILE"])
 
-          destination = Path(
-              os.environ["RUNNER_TEMP"]
-          ) / "datadog.yaml"
+          if not source.is_file():
+              raise SystemExit(f"Source file does not exist: {source}")
 
           content = source.read_text()
 
           placeholder = "${DATADOG_API_KEY}"
+          placeholder_count = content.count(placeholder)
 
-          if content.count(placeholder) != 1:
+          if placeholder_count != 1:
               raise SystemExit(
-                  "datadog.yaml must contain exactly one "
-                  "${DATADOG_API_KEY} placeholder"
+                  f"{source} must contain exactly one "
+                  f"${{DATADOG_API_KEY}} placeholder. "
+                  f"Found: {placeholder_count}"
               )
 
           content = content.replace(
@@ -78,69 +159,59 @@ jobs:
           destination.chmod(0o600)
           PY
 
-      - name: Copy main-config playbook and rendered config
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-        run: |
-          set -Eeuo pipefail
+            REMOTE_HOME="/home/$VM_USER"
+            remote_config="$REMOTE_HOME/datadog-staging/main-config/datadog.yaml"
 
-          REMOTE_HOME="/home/$VM_USER"
+            ssh \
+              -o StrictHostKeyChecking=no \
+              -i "$HOME/.ssh/id_rsa" \
+              "$VM_USER@$VM_HOST_SELECTED" \
+              "mkdir -p \
+                '$REMOTE_HOME/datadog-deployment/playbooks' \
+                '$REMOTE_HOME/datadog-deployment/inventory' \
+                '$REMOTE_HOME/datadog-staging/main-config'"
 
-          ssh -o StrictHostKeyChecking=no \
-            -i "$HOME/.ssh/id_rsa" \
-            "$VM_USER@$VM_HOST" \
-            "mkdir -p \
-              '$REMOTE_HOME/datadog-deployment/playbooks' \
-              '$REMOTE_HOME/datadog-deployment/inventory' \
-              '$REMOTE_HOME/datadog-staging/main-config'"
+            scp \
+              -o StrictHostKeyChecking=no \
+              -i "$HOME/.ssh/id_rsa" \
+              playbooks/deploy-datadog-main-config.yml \
+              "$VM_USER@$VM_HOST_SELECTED:$REMOTE_HOME/datadog-deployment/playbooks/"
 
-          scp -o StrictHostKeyChecking=no \
-            -i "$HOME/.ssh/id_rsa" \
-            playbooks/deploy-datadog-main-config.yml \
-            "$VM_USER@$VM_HOST:$REMOTE_HOME/datadog-deployment/playbooks/"
+            scp \
+              -o StrictHostKeyChecking=no \
+              -i "$HOME/.ssh/id_rsa" \
+              inventory/hosts.ini \
+              "$VM_USER@$VM_HOST_SELECTED:$REMOTE_HOME/datadog-deployment/inventory/"
 
-          scp -o StrictHostKeyChecking=no \
-            -i "$HOME/.ssh/id_rsa" \
-            inventory/hosts.ini \
-            "$VM_USER@$VM_HOST:$REMOTE_HOME/datadog-deployment/inventory/"
+            scp \
+              -o StrictHostKeyChecking=no \
+              -i "$HOME/.ssh/id_rsa" \
+              "$rendered_file" \
+              "$VM_USER@$VM_HOST_SELECTED:$remote_config"
 
-          scp -o StrictHostKeyChecking=no \
-            -i "$HOME/.ssh/id_rsa" \
-            "$RUNNER_TEMP/datadog.yaml" \
-            "$VM_USER@$VM_HOST:$REMOTE_HOME/datadog-staging/main-config/datadog.yaml"
+            ssh \
+              -o StrictHostKeyChecking=no \
+              -i "$HOME/.ssh/id_rsa" \
+              "$VM_USER@$VM_HOST_SELECTED" \
+              "chmod 600 '$remote_config'"
 
-          ssh -o StrictHostKeyChecking=no \
-            -i "$HOME/.ssh/id_rsa" \
-            "$VM_USER@$VM_HOST" \
-            "chmod 600 \
-              '$REMOTE_HOME/datadog-staging/main-config/datadog.yaml'"
+            ssh \
+              -o StrictHostKeyChecking=no \
+              -i "$HOME/.ssh/id_rsa" \
+              "$VM_USER@$VM_HOST_SELECTED" \
+              "cd '$REMOTE_HOME/datadog-deployment' && \
+               ansible-playbook \
+                 -i inventory/hosts.ini \
+                 playbooks/deploy-datadog-main-config.yml \
+                 --extra-vars \
+                 'source_file=$remote_config'"
 
-      - name: Deploy datadog.yaml
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-        run: |
-          set -Eeuo pipefail
+            ssh \
+              -o StrictHostKeyChecking=no \
+              -i "$HOME/.ssh/id_rsa" \
+              "$VM_USER@$VM_HOST_SELECTED" \
+              "sudo systemctl is-active datadog-agent"
 
-          REMOTE_HOME="/home/$VM_USER"
+            echo "Deployment completed for $environment/$vm_name"
 
-          ssh -o StrictHostKeyChecking=no \
-            -i "$HOME/.ssh/id_rsa" \
-            "$VM_USER@$VM_HOST" \
-            "cd '$REMOTE_HOME/datadog-deployment' && \
-             ansible-playbook \
-               -i inventory/hosts.ini \
-               playbooks/deploy-datadog-main-config.yml \
-               --extra-vars \
-               'source_file=$REMOTE_HOME/datadog-staging/main-config/datadog.yaml'"
-
-      - name: Verify Datadog Agent
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-        run: |
-          ssh -o StrictHostKeyChecking=no \
-            -i "$HOME/.ssh/id_rsa" \
-            "$VM_USER@$VM_HOST" \
-            "sudo systemctl is-active datadog-agent"
+          done < changed-main-configs.txt
