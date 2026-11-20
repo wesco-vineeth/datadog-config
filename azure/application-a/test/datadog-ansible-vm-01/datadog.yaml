@@ -185,7 +185,7 @@ site: us3.datadoghq.com
 ## The environment name where the agent is running. Attached in-app to every
 ## metric, event, log, trace, and service check emitted by this Agent.
 #
-# env: <environment name>
+env: test
 
 ## @param remote_updates - boolean - optional - default: true
 ## @env DD_REMOTE_UPDATES - boolean - optional - default: true
