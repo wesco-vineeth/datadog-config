@@ -3,7 +3,7 @@
 ## Basic Configuration ##
 #########################
 
-api_key: ${DATADOG_API_KEY_ROKO}
+api_key: ${DATADOG_API_KEY_NEW}
 
 site: us3.datadoghq.com
 
