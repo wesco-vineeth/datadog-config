@@ -1,0 +1,268 @@
+---
+# One playbook for both kinds of change to /etc/datadog-agent/datadog.yaml:
+#   source_file  - staged datadog.yaml from the repo. Deployed as-is, except the api_key
+#                  line always stays as it is on the server.
+#   api_key_file - file holding a new API key. Only the api_key line is replaced.
+# Either or both can be given. When both are, they are applied together: one backup,
+# one restart, one verification.
+#
+# Flow: agent running (key updates) -> build final file -> differs from server? ->
+#       backup datadog.yaml.<date> -> deploy -> restart -> verify
+# If anything fails the backup is restored and the agent restarted. If the final file is
+# identical to the one on the server, nothing is changed, backed up or restarted.
+# Temporary files (staged file, key file) are always removed.
+- name: Deploy Datadog configuration
+  hosts: datadog
+  become: true
+  gather_facts: false
+
+  vars:
+    datadog_config: /etc/datadog-agent/datadog.yaml
+    backups_to_keep: 5
+
+  tasks:
+    - name: Deploy datadog.yaml and/or API key (always removes temporary files)
+      block:
+        - name: Confirm there is something to do
+          ansible.builtin.assert:
+            that:
+              - (source_file | default('') | length > 0) or (api_key_file | default('') | length > 0)
+            fail_msg: "Pass source_file (config update) and/or api_key_file (API key update)."
+
+        - name: Work out what to update
+          ansible.builtin.set_fact:
+            update_config: "{{ (source_file | default('') | length > 0) | bool }}"
+            update_api_key: "{{ (api_key_file | default('') | length > 0) | bool }}"
+
+        # 1. For key updates the agent must be running before we touch anything
+        - name: Check Datadog Agent status before update
+          ansible.builtin.command:
+            cmd: systemctl is-active datadog-agent
+          register: agent_pre_status
+          changed_when: false
+          failed_when: false
+          when: update_api_key | bool
+
+        - name: Confirm Datadog Agent is running
+          ansible.builtin.assert:
+            that:
+              - agent_pre_status.stdout == "active"
+            fail_msg: "Datadog Agent is not running (status: {{ agent_pre_status.stdout }}). API key was NOT updated."
+            success_msg: "Datadog Agent is running."
+          when: update_api_key | bool
+
+        # 2. Current state of the server
+        - name: Check existing datadog.yaml on the server
+          ansible.builtin.stat:
+            path: "{{ datadog_config }}"
+            get_checksum: true
+          register: current_config
+
+        - name: Confirm datadog.yaml exists for an API key update
+          ansible.builtin.assert:
+            that:
+              - current_config.stat.exists
+            fail_msg: "{{ datadog_config }} is missing. API key was NOT updated."
+          when: update_api_key | bool and not update_config | bool
+
+        - name: Read existing datadog.yaml
+          ansible.builtin.slurp:
+            src: "{{ datadog_config }}"
+          register: current_config_content
+          when: current_config.stat.exists
+          no_log: true
+
+        # 3. Build the final file in a working copy
+        - name: Choose working file
+          ansible.builtin.set_fact:
+            work_file: "{{ source_file if update_config | bool else (api_key_file | dirname) ~ '/datadog.yaml.work' }}"
+
+        - name: Start from the current server file (API key only update)
+          ansible.builtin.copy:
+            src: "{{ datadog_config }}"
+            dest: "{{ work_file }}"
+            remote_src: true
+            mode: "0600"
+          when: not update_config | bool
+          no_log: true
+
+        - name: Find the api_key line currently on the server
+          ansible.builtin.set_fact:
+            preserved_api_key_line: >-
+              {{
+                (current_config_content.content | b64decode)
+                | regex_search('(?m)^api_key:.*$')
+                | default('', true)
+              }}
+          when: current_config.stat.exists
+          no_log: true
+
+        - name: Keep the server's api_key in the staged file
+          ansible.builtin.lineinfile:
+            path: "{{ work_file }}"
+            regexp: '^api_key:.*$'
+            line: "{{ preserved_api_key_line }}"
+            backup: false
+          when:
+            - update_config | bool
+            - current_config.stat.exists
+            - preserved_api_key_line | default('') | length > 0
+          no_log: true
+
+        - name: Check temporary API key file
+          ansible.builtin.stat:
+            path: "{{ api_key_file }}"
+          register: api_key_file_status
+          when: update_api_key | bool
+          no_log: true
+
+        - name: Confirm the API key file is present
+          ansible.builtin.assert:
+            that:
+              - api_key_file_status.stat.exists
+              - api_key_file_status.stat.size > 0
+            fail_msg: "The temporary API key file is missing or empty."
+          when: update_api_key | bool
+          no_log: true
+
+        - name: Read new API key
+          ansible.builtin.slurp:
+            src: "{{ api_key_file }}"
+          register: api_key_content
+          when: update_api_key | bool
+          no_log: true
+
+        - name: Set the new api_key in the file to deploy
+          ansible.builtin.lineinfile:
+            path: "{{ work_file }}"
+            regexp: '^api_key:.*$'
+            line: "api_key: {{ api_key_content.content | b64decode | trim }}"
+            backup: false
+          when: update_api_key | bool
+          no_log: true
+
+        # 4. Only continue if the final file really differs from the server's
+        - name: Check final datadog.yaml
+          ansible.builtin.stat:
+            path: "{{ work_file }}"
+            get_checksum: true
+          register: final_config
+
+        - name: Compare final file with the file on the server
+          ansible.builtin.set_fact:
+            config_changed: "{{ (not current_config.stat.exists or current_config.stat.checksum != final_config.stat.checksum) | bool }}"
+
+        - name: No change needed
+          ansible.builtin.debug:
+            msg: "datadog.yaml on the server already matches. Nothing to update."
+          when: not config_changed | bool
+
+        - name: Backup, deploy and verify
+          when: config_changed | bool
+          block:
+            # 5. Backup as datadog.yaml.<date>
+            - name: Get date for backup name
+              ansible.builtin.command:
+                cmd: date +%Y%m%d-%H%M%S
+              register: backup_ts
+              changed_when: false
+
+            - name: Backup datadog.yaml as datadog.yaml.<date>
+              ansible.builtin.copy:
+                src: "{{ datadog_config }}"
+                dest: "{{ datadog_config }}.{{ backup_ts.stdout }}"
+                remote_src: true
+                owner: dd-agent
+                group: dd-agent
+                mode: "0640"
+              when: current_config.stat.exists
+              no_log: true
+
+            - name: Remember backup path
+              ansible.builtin.set_fact:
+                backup_path: "{{ datadog_config }}.{{ backup_ts.stdout }}"
+              when: current_config.stat.exists
+
+            # 6. Deploy, restart and verify
+            - name: Deploy datadog.yaml
+              ansible.builtin.copy:
+                src: "{{ work_file }}"
+                dest: "{{ datadog_config }}"
+                remote_src: true
+                owner: dd-agent
+                group: dd-agent
+                mode: "0640"
+                backup: false
+              no_log: true
+
+            - name: Restart Datadog Agent
+              ansible.builtin.service:
+                name: datadog-agent
+                state: restarted
+
+            - name: Wait for Datadog Agent to become active
+              ansible.builtin.command:
+                cmd: systemctl is-active datadog-agent
+              register: agent_post_status
+              until: agent_post_status.stdout == "active"
+              retries: 6
+              delay: 5
+              changed_when: false
+
+            - name: Check Datadog Agent health
+              ansible.builtin.command:
+                cmd: datadog-agent health
+              register: agent_health
+              until: agent_health.rc == 0
+              retries: 6
+              delay: 5
+              changed_when: false
+              no_log: true
+
+            # 7. Keep only the latest backups
+            - name: Find datadog.yaml backups
+              ansible.builtin.find:
+                paths: /etc/datadog-agent
+                patterns: '^datadog\.yaml\.\d{8}-\d{6}$'
+                use_regex: true
+              register: config_backups
+
+            - name: Remove old backups
+              ansible.builtin.file:
+                path: "{{ item.path }}"
+                state: absent
+              loop: "{{ (config_backups.files | sort(attribute='mtime', reverse=true))[backups_to_keep:] }}"
+              loop_control:
+                label: "{{ item.path | basename }}"
+
+          rescue:
+            - name: Restore datadog.yaml from backup
+              ansible.builtin.copy:
+                src: "{{ backup_path }}"
+                dest: "{{ datadog_config }}"
+                remote_src: true
+                owner: dd-agent
+                group: dd-agent
+                mode: "0640"
+              when: backup_path is defined
+              no_log: true
+
+            - name: Restart Datadog Agent with the restored config
+              ansible.builtin.service:
+                name: datadog-agent
+                state: restarted
+              when: backup_path is defined
+
+            - name: Fail after rollback
+              ansible.builtin.fail:
+                msg: >-
+                  Datadog configuration update failed.
+                  {{ 'datadog.yaml was restored from ' ~ backup_path ~ ' and the agent restarted.' if backup_path is defined else 'There was no previous datadog.yaml to restore.' }}
+
+      always:
+        - name: Remove temporary files (staged file, API key file, working copy)
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop: "{{ [source_file | default(''), api_key_file | default(''), work_file | default('')] | select | unique | list }}"
+          no_log: true
