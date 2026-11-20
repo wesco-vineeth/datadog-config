@@ -3,7 +3,7 @@
 ## Basic Configuration ##
 #########################
 
-api_key: ${DATADOG_API_KEY_NEW}
+api_key: ${DATADOG_API_KEY_ROKO}
 
 site: us3.datadoghq.com
 
@@ -11,7 +11,7 @@ process_config:
   process_collection:
     enabled: true
 
-env: test
+env: dev
 service : action
 version: v1.0.0
 # tags: 
