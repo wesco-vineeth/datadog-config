@@ -1,0 +1,242 @@
+name: Deploy Datadog Config
+
+# One workflow for every datadog.yaml change that is merged to main:
+#   - config change  (any line except api_key)  -> deploys the file, server's api_key is kept
+#   - api_key change (api_key: ${SECRET_NAME})   -> updates only the key, using that GitHub secret
+#   - both in the same PR                        -> applied together on the VM (one backup, one restart)
+# Only the VM folders that changed are touched. Several VMs in one PR are handled one after
+# another; a failure on one does not stop the others. A VM that already matches is a no-op.
+# Before every change the VM's datadog.yaml is backed up as datadog.yaml.<date> and
+# restored automatically if the update fails.
+#
+# GitHub cannot filter a trigger by line content, so any merged datadog.yaml edit starts
+# a run; the `deploy` job is skipped when neither the config nor the api_key line changed.
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - closed
+    paths:
+      - "azure/*/*/*/datadog.yaml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: datadog-config-deployment
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    outputs:
+      has_updates: ${{ steps.changes.outputs.has_updates }}
+      updates: ${{ steps.changes.outputs.updates }}
+
+    steps:
+      - name: Checkout merged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+
+      - name: Detect what changed in each datadog.yaml
+        id: changes
+        shell: bash
+        env:
+          MERGE: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -Eeuo pipefail
+
+          BASE="${MERGE}^1"
+          secret_ref_re='^api_key:[[:space:]]*\$\{([A-Za-z_][A-Za-z0-9_]*)\}[[:space:]]*$'
+
+          without_api_key() { tr -d '\r' | grep -v -E '^api_key:' || true; }
+          api_key_line()    { tr -d '\r' | grep -m1 -E '^api_key:' || true; }
+
+          : > updates.tsv
+
+          while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+
+            new_file="$(git show "$MERGE:$file")"
+            old_file="$(git show "$BASE:$file" 2>/dev/null || true)"
+
+            # 1. Anything other than the api_key line?
+            config="false"
+            if [[ "$(without_api_key <<< "$new_file")" != "$(without_api_key <<< "$old_file")" ]]; then
+              config="true"
+            fi
+
+            # 2. Did the api_key line (the secret name) change?
+            secret=""
+            new_line="$(api_key_line <<< "$new_file")"
+            old_line="$(api_key_line <<< "$old_file")"
+            if [[ "$new_line" != "$old_line" ]]; then
+              if [[ "$new_line" =~ $secret_ref_re ]]; then
+                secret="${BASH_REMATCH[1]}"
+
+                # Never let a config change pull infrastructure secrets onto a VM
+                if [[ "$secret" == VM_* || "$secret" == GITHUB_* ]]; then
+                  echo "::error file=$file::Secret name '$secret' is not allowed as an API key."
+                  exit 1
+                fi
+              else
+                echo "::warning file=$file::api_key must look like 'api_key: \${SECRET_NAME}'. API key part skipped."
+              fi
+            fi
+
+            if [[ "$config" == "false" && -z "$secret" ]]; then
+              echo "SKIP  $file - no config change and api_key line unchanged"
+              continue
+            fi
+
+            echo "APPLY $file - config=$config api_key_secret=${secret:-none}"
+            printf '%s\t%s\t%s\n' "$file" "$config" "$secret" >> updates.tsv
+          done < <(git diff --name-only --diff-filter=AM "$BASE" "$MERGE" -- ':(glob)azure/*/*/*/datadog.yaml')
+
+          if [[ -s updates.tsv ]]; then
+            echo "has_updates=true" >> "$GITHUB_OUTPUT"
+            echo "updates=$(jq -Rnc '[inputs | split("\t") | {file: .[0], config: (.[1] == "true"), secret: .[2]}]' < updates.tsv)" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_updates=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing to deploy."
+          fi
+
+  deploy:
+    needs: detect
+    if: needs.detect.outputs.has_updates == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout merged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Configure SSH
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+        run: |
+          set -Eeuo pipefail
+
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VM_SSH_KEY" > "$HOME/.ssh/id_rsa"
+          chmod 600 "$HOME/.ssh/id_rsa"
+
+      - name: Deploy to each changed VM
+        shell: bash
+        env:
+          VM_USER: ${{ secrets.VM_USER }}
+          # Optional JSON map of VM folder name -> host/IP override, e.g. {"datadog-ansible-vm-03":"10.0.0.5"}
+          VM_HOSTS: ${{ secrets.VM_HOSTS }}
+          # Lets the secret named in datadog.yaml be looked up dynamically
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+          UPDATES: ${{ needs.detect.outputs.updates }}
+        run: |
+          set -Eeuo pipefail
+
+          SSH_OPTS=(-o StrictHostKeyChecking=no -i "$HOME/.ssh/id_rsa")
+          REMOTE_HOME="/home/$VM_USER"
+
+          # VM_HOSTS override if present, otherwise the VM folder name is the hostname
+          resolve_host() {
+            local vm_name="$1" host=""
+            if [[ -n "${VM_HOSTS:-}" ]]; then
+              host="$(jq -r --arg vm "$vm_name" '.[$vm] // empty' <<< "$VM_HOSTS")"
+            fi
+            printf '%s' "${host:-$vm_name}"
+          }
+
+          deploy_vm() {
+            local file="$1" config="$2" secret="$3"
+            local application environment vm_name host remote_source remote_key api_key key_file extra
+
+            # azure/<application>/<environment>/<vm_name>/datadog.yaml
+            application="$(cut -d/ -f2 <<< "$file")"
+            environment="$(cut -d/ -f3 <<< "$file")"
+            vm_name="$(cut -d/ -f4 <<< "$file")"
+            host="$(resolve_host "$vm_name")"
+            remote_source="$REMOTE_HOME/datadog-staging/$application/$environment/$vm_name/datadog.yaml"
+            remote_key="$REMOTE_HOME/datadog-secret/api_key"
+
+            echo "======================================"
+            echo "Application : $application"
+            echo "Environment : $environment"
+            echo "VM          : $vm_name"
+            echo "Host        : $host"
+            echo "File        : $file"
+            echo "Config      : $config"
+            echo "API key     : ${secret:-unchanged}"
+            echo "======================================"
+
+            extra=""
+            key_file=""
+
+            if [[ "$config" == "true" ]]; then
+              extra+=" -e 'source_file=$remote_source'"
+            fi
+
+            if [[ -n "$secret" ]]; then
+              api_key="$(jq -r --arg n "$secret" '.[$n] // empty' <<< "$ALL_SECRETS")"
+              if [[ -z "$api_key" ]]; then
+                echo "::error::Secret '$secret' is not set in this repository. Add it, then re-run this workflow."
+                return 1
+              fi
+              key_file="$(mktemp -p "$RUNNER_TEMP")"
+              chmod 600 "$key_file"
+              printf '%s' "$api_key" > "$key_file"
+              extra+=" -e 'api_key_file=$remote_key'"
+            fi
+
+            local rc=0
+            {
+              ssh "${SSH_OPTS[@]}" "$VM_USER@$host" \
+                "mkdir -p '$REMOTE_HOME/datadog-deployment/playbooks' '$REMOTE_HOME/datadog-deployment/inventory' '$REMOTE_HOME/datadog-secret' '$(dirname "$remote_source")' && chmod 700 '$REMOTE_HOME/datadog-secret'" &&
+              scp "${SSH_OPTS[@]}" playbooks/deploy-datadog-config.yml "$VM_USER@$host:$REMOTE_HOME/datadog-deployment/playbooks/" &&
+              scp "${SSH_OPTS[@]}" inventory/hosts.ini "$VM_USER@$host:$REMOTE_HOME/datadog-deployment/inventory/" &&
+              { [[ "$config" != "true" ]] || scp "${SSH_OPTS[@]}" "$file" "$VM_USER@$host:$remote_source"; } &&
+              { [[ -z "$key_file" ]] || { scp "${SSH_OPTS[@]}" "$key_file" "$VM_USER@$host:$remote_key" && ssh "${SSH_OPTS[@]}" "$VM_USER@$host" "chmod 600 '$remote_key'"; }; } &&
+              ssh "${SSH_OPTS[@]}" "$VM_USER@$host" \
+                "cd '$REMOTE_HOME/datadog-deployment' && ansible-playbook -i inventory/hosts.ini playbooks/deploy-datadog-config.yml$extra" &&
+              ssh "${SSH_OPTS[@]}" "$VM_USER@$host" "systemctl is-active datadog-agent"
+            } || rc=$?
+
+            if [[ -n "$key_file" ]]; then
+              rm -f "$key_file"
+              ssh "${SSH_OPTS[@]}" "$VM_USER@$host" "rm -f '$remote_key'" || true
+            fi
+
+            return "$rc"
+          }
+
+          failed=()
+          done_vms=()
+
+          # Keep going until every changed VM has been handled; one failure must not block the rest
+          while IFS=$'\t' read -r file config secret; do
+            [[ -z "$file" ]] && continue
+            [[ "$secret" == "-" ]] && secret=""
+            if deploy_vm "$file" "$config" "$secret"; then
+              done_vms+=("$file")
+            else
+              failed+=("$file")
+            fi
+          done < <(jq -r '.[] | [.file, (.config | tostring), (if .secret == "" then "-" else .secret end)] | @tsv' <<< "$UPDATES")
+
+          echo
+          echo "Deployed / already current: ${#done_vms[@]}"
+          for f in "${done_vms[@]}"; do echo "  OK    $f"; done
+
+          if (( ${#failed[@]} > 0 )); then
+            echo "Failed: ${#failed[@]}"
+            for f in "${failed[@]}"; do echo "  FAIL  $f"; done
+            exit 1
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: rm -f "$HOME/.ssh/id_rsa"
